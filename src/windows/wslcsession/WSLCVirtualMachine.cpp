@@ -685,6 +685,8 @@ std::vector<std::string> WSLCVirtualMachine::ListDirectory(const std::string& Pa
     message.WriteString(Path);
 
     gsl::span<gsl::byte> responseSpan;
+
+    std::lock_guard lock{m_lock};
     const auto& response = m_initChannel.Transaction<WSLC_LISTDIR>(message.Span(), &responseSpan, m_initChannelTimeout);
 
     THROW_HR_IF_MSG(E_FAIL, response.Result != 0, "Failed to list directory '%hs', init returned: %d", Path.c_str(), response.Result);
@@ -1268,21 +1270,23 @@ try
     const bool readOnly = WI_IsFlagSet(Flags, WSLCMountFlagsReadOnly);
     GUID shareGuid{};
 
-    {
-        std::lock_guard lock(m_lock);
+    std::unique_lock lock(m_lock);
 
-        // Verify that this folder isn't already mounted.
-        auto it = m_mountedWindowsFolders.find(LinuxPath);
-        THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), it != m_mountedWindowsFolders.end());
+    // Verify that this folder isn't already mounted.
+    auto it = m_mountedWindowsFolders.find(LinuxPath);
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), it != m_mountedWindowsFolders.end());
 
-        // Delegate to IWSLCVirtualMachine for the privileged share creation.
-        THROW_IF_FAILED(m_vm->AddShare(WindowsPath, readOnly, &shareGuid));
+    // Delegate to IWSLCVirtualMachine for the privileged share creation.
+    THROW_IF_FAILED(m_vm->AddShare(WindowsPath, readOnly, &shareGuid));
 
-        m_mountedWindowsFolders.emplace(LinuxPath, shareGuid);
-    }
+    m_mountedWindowsFolders.emplace(LinuxPath, shareGuid);
 
     auto deleteOnFailure = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&]() {
-        std::lock_guard lock(m_lock);
+        if (!lock.owns_lock())
+        {
+            lock.lock();
+        }
+
         auto mountIt = m_mountedWindowsFolders.find(LinuxPath);
         if (WI_VERIFY(mountIt != m_mountedWindowsFolders.end()))
         {
@@ -1291,12 +1295,14 @@ try
         }
     });
 
+    auto [_, __, channel] = Fork(WSLC_FORK::Thread);
+
+    lock.unlock();
+
     // Create the guest mount
     auto shareName = shared::string::GuidToString<char>(shareGuid, shared::string::None);
     if (!FeatureEnabled(WslcFeatureFlagsVirtioFs))
     {
-        auto [_, __, channel] = Fork(WSLC_FORK::Process);
-
         WSLC_CONNECT message;
         message.HostPort = LX_INIT_UTILITY_VM_PLAN9_PORT;
 
@@ -1311,7 +1317,7 @@ try
     else
     {
         std::string options = readOnly ? "ro" : "rw";
-        MountVirtioFsChild(m_initChannel, LX_INIT_DRVFS_VIRTIO_TAG, shareName.c_str(), LinuxPath, options.c_str(), Flags);
+        MountVirtioFsChild(channel, LX_INIT_DRVFS_VIRTIO_TAG, shareName.c_str(), LinuxPath, options.c_str(), Flags);
     }
 
     deleteOnFailure.release();
